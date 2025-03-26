@@ -1,0 +1,10 @@
+.envrc
+.aider*
+# Added by goreleaser init:
+dist/
+clamdproxy
+PROTOCOL.md
+.zsh*
+
+# Local config files
+codemcp.toml

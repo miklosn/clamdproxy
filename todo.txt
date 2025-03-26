@@ -1,0 +1,25 @@
+# clamdproxy: High Priority Improvements
+
+## Security Enhancements
+1. TLS Support - Add TLS encryption for both client and backend connections to secure virus scanning traffic in transit
+2. Authentication - Implement client authentication mechanism (e.g., API keys, mutual TLS) to restrict proxy access to authorized clients
+3. Command Customization - Allow administrators to configure the allowed/blocked command list via configuration file rather than hardcoded values
+4. Rate Limiting - Implement connection and request rate limiting to prevent DoS attacks
+
+## Operational Improvements
+1. Multiple Backend Support - Support multiple clamd backends with load balancing for high availability and throughput
+2. Health Checking - Add active health checks for backend clamd instances to detect failures and implement failover
+3. Metrics & Monitoring - Expose Prometheus metrics for virus scanning activity, blocked commands, and performance data
+4. Configuration File - Replace command-line arguments with a configuration file for more complex setups
+
+## Performance Optimizations
+1. Connection Pooling - Implement backend connection pooling to reduce connection overhead for frequent scanning requests
+2. Streaming Optimization - Improve INSTREAM handling with more efficient memory management for very large files
+
+## Resiliency
+1. Circuit Breaker - Implement circuit breaker pattern to gracefully handle backend failures
+2. Request Timeouts - Add configurable timeouts for scanning operations to prevent resource exhaustion
+
+## Project Infrastructure
+1. Containerization - Provide official Docker image and Kubernetes deployment examples
+2. Automated Testing - Expand test coverage with integration tests against actual clamd instances
