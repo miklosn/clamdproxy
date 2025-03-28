@@ -32,7 +32,7 @@ Common use cases include:
 
 ### Using Pre-built Binaries
 
-The easiest way to get started is to download a pre-built binary from the [GitHub Releases](https://github.com/yourusername/clamdproxy/releases) page:
+The easiest way to get started is to download a pre-built binary from the [GitHub Releases](https://github.com/miklosn/clamdproxy/releases) page:
 
 1. Navigate to the latest release
 2. Download the appropriate binary for your platform (Linux, macOS, Windows)
@@ -53,7 +53,7 @@ The easiest way to get started is to download a pre-built binary from the [GitHu
 If you prefer to build from source:
 
 ```
-git clone https://github.com/yourusername/clamdproxy.git
+git clone https://github.com/miklosn/clamdproxy.git
 cd clamdproxy
 go build -o clamdproxy
 ```
