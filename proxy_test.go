@@ -85,6 +85,25 @@ func TestReadCommand(t *testing.T) {
 }
 
 func TestIsCommandAllowed(t *testing.T) {
+	// Save original allowedCommands
+	originalAllowed := make(map[string]bool)
+	for k, v := range allowedCommands {
+		originalAllowed[k] = v
+	}
+	
+	// Restore after test
+	defer func() {
+		allowedCommands = originalAllowed
+	}()
+	
+	// Set test allowed commands
+	allowedCommands = map[string]bool{
+		"PING":            true,
+		"VERSION":         true,
+		"VERSIONCOMMANDS": true,
+		"INSTREAM":        true,
+	}
+	
 	allowedCmds := []string{
 		"PING", "VERSION", "VERSIONCOMMANDS", "INSTREAM",
 		"zPING", "zVERSION", "zVERSIONCOMMANDS", "zINSTREAM",

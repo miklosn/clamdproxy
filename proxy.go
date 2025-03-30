@@ -37,7 +37,25 @@ const (
 	newlineDelimiter = byte('\n')
 )
 
-// allowedCommands defines the only commands that are permitted to be forwarded
+// validClamdCommands defines all known valid clamd commands
+var validClamdCommands = map[string]bool{
+	"PING":            true,
+	"VERSION":         true,
+	"RELOAD":          true,
+	"SHUTDOWN":        true,
+	"SCAN":            true,
+	"INSTREAM":        true,
+	"FILDES":          true,
+	"STATS":           true,
+	"IDSESSION":       true,
+	"END":             true,
+	"VERSIONCOMMANDS": true,
+	"MULTISCAN":       true,
+	"CONTSCAN":        true,
+	"ALLMATCHSCAN":    true,
+}
+
+// allowedCommands defines the commands that are permitted to be forwarded
 // to the backend for security reasons
 var allowedCommands = map[string]bool{
 	"PING":            true,
@@ -70,7 +88,7 @@ func NewClamdProxy(client, backend net.Conn) *ClamdProxy {
 // directly processes backend->client traffic in the current goroutine.
 func (p *ClamdProxy) Start() {
 	clientAddr := p.client.RemoteAddr()
-	logger.Info("Starting proxy", "client", &clientAddr)
+	logger.Info("Starting proxy", "client", clientAddr)
 
 	// Handle client -> backend in a separate goroutine
 	go p.handleClientToBackend()
@@ -119,17 +137,17 @@ func (p *ClamdProxy) Start() {
 
 	if err != nil {
 		if isConnectionClosed(err) {
-			logger.Info("Backend connection closed",
-				"client", &clientAddr,
+			logger.Debug("Backend connection closed",
+				"client", clientAddr,
 				"error", err)
 		} else {
 			logger.Debug("Error copying from backend to client",
-				"client", &clientAddr,
+				"client", clientAddr,
 				"error", err)
 		}
 	} else {
 		logger.Info("Proxy completed",
-			"client", &clientAddr,
+			"client", clientAddr,
 			"bytesTransferred", bytesWritten)
 	}
 }
@@ -146,13 +164,13 @@ func (p *ClamdProxy) handleClientToBackend() {
 		if err != nil {
 			if err == io.EOF {
 				// Normal client disconnection, log at debug level
-				logger.Info("Client disconnected", "client", &clientAddr)
+				logger.Info("Client disconnected", "client", clientAddr)
 			} else {
 				// Only log as error if it's not a connection reset or broken pipe
 				if isConnectionClosed(err) {
-					logger.Info("Client connection closed", "client", &clientAddr, "error", err)
+					logger.Debug("Client connection closed", "client", clientAddr, "error", err)
 				} else {
-					logger.Debug("Error reading command", "client", &clientAddr, "error", err)
+					logger.Debug("Error reading command", "client", clientAddr, "error", err)
 				}
 			}
 			// Close the backend connection to signal we're done
@@ -163,7 +181,7 @@ func (p *ClamdProxy) handleClientToBackend() {
 		}
 
 		// Only log commands at appropriate levels
-		logger.Debug("Command received", "client", &clientAddr, "command", &cmd)
+		logger.Debug("Command received", "client", clientAddr, "command", cmd)
 
 		// Check if command is allowed
 		if isCommandAllowed(cmd) {
@@ -180,17 +198,17 @@ func (p *ClamdProxy) handleClientToBackend() {
 
 			// Handle special case for INSTREAM command (file streaming)
 			if isInstreamCommand(cmd) {
-				logger.Debug("Processing INSTREAM data", "client", &clientAddr)
+				logger.Debug("Processing INSTREAM data", "client", clientAddr)
 
 				if err := p.handleInstream(reader); err != nil {
 					logger.Debug("Error handling INSTREAM data",
-						"client", &clientAddr,
+						"client", clientAddr,
 						"error", err)
 					break
 				}
 			}
 		} else {
-			logger.Info("Blocked command", "client", &clientAddr, "command", &cmd)
+			logger.Info("Blocked command", "client", clientAddr, "command", cmd)
 			// Send error response to client using buffered writer
 			response := "ERROR: Command not allowed\n"
 			if _, err := p.clientBuf.WriteString(response); err != nil {
@@ -320,7 +338,7 @@ func (p *ClamdProxy) handleInstream(reader *bufio.Reader) error {
 		// If size is 0, we're done with the stream
 		if size == 0 {
 			logger.Debug("INSTREAM completed",
-				"client", &clientAddr,
+				"client", clientAddr,
 				"totalBytes", totalBytes,
 				"chunks", chunks)
 			break
@@ -359,7 +377,7 @@ func (p *ClamdProxy) handleInstream(reader *bufio.Reader) error {
 		// Only log chunk details at the most verbose level and only occasionally
 		if chunks%100 == 0 {
 			logger.Debug("INSTREAM progress",
-				"client", &clientAddr,
+				"client", clientAddr,
 				"chunks", chunks,
 				"totalBytes", totalBytes)
 		}

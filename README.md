@@ -72,6 +72,7 @@ clamdproxy --listen 127.0.0.1:3310 --backend 127.0.0.1:3311
 - `--backend`: Address of the backend clamd server (default: 127.0.0.1:3311)
 - `--log-level`: Logging level: debug, info, warn, error (default: warn)
 - `--pprof`: Address for pprof HTTP server (disabled if empty)
+- `--allow-command`: ClamAV command to allow (can be specified multiple times). If not specified, defaults to a subset of commands (PING, VERSION, VERSIONCOMMANDS, INSTREAM).
 
 ## Protocol
 
