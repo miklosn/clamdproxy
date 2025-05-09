@@ -90,12 +90,12 @@ func TestIsCommandAllowed(t *testing.T) {
 	for k, v := range allowedCommands {
 		originalAllowed[k] = v
 	}
-	
+
 	// Restore after test
 	defer func() {
 		allowedCommands = originalAllowed
 	}()
-	
+
 	// Set test allowed commands
 	allowedCommands = map[string]bool{
 		"PING":            true,
@@ -103,7 +103,7 @@ func TestIsCommandAllowed(t *testing.T) {
 		"VERSIONCOMMANDS": true,
 		"INSTREAM":        true,
 	}
-	
+
 	allowedCmds := []string{
 		"PING", "VERSION", "VERSIONCOMMANDS", "INSTREAM",
 		"zPING", "zVERSION", "zVERSIONCOMMANDS", "zINSTREAM",

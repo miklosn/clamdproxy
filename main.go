@@ -20,6 +20,7 @@ var cli struct {
 	Backend         string   `name:"backend" help:"Address of the backend clamd server" default:"127.0.0.1:3311"`
 	LogLevel        string   `name:"log-level" help:"Log level (debug, info, warn, error)" default:"warn" enum:"debug,info,warn,error"`
 	PprofAddr       string   `name:"pprof" help:"Address for pprof HTTP server (disabled if empty)" default:""`
+	MetricsAddr     string   `name:"metrics" help:"Address for OpenTelemetry metrics HTTP server (disabled if empty)" default:""`
 	AllowedCommands []string `name:"allow-command" help:"ClamAV commands to allow (can be specified multiple times)"`
 }
 
@@ -49,6 +50,14 @@ func getLogger(logLevel string) *slog.Logger {
 }
 
 func main() {
+	// Add panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic recovered", "error", r)
+			os.Exit(1)
+		}
+	}()
+
 	// Parse command line arguments with Kong
 	ctx := kong.Parse(&cli)
 	_ = ctx // You can use ctx for subcommands if needed in the future
@@ -59,6 +68,22 @@ func main() {
 
 	// Initialize allowed commands
 	initAllowedCommands()
+
+	// Initialize metrics if enabled
+	if cli.MetricsAddr != "" {
+		logger.Debug("Initializing metrics", "addr", cli.MetricsAddr) // Add debug log
+		metrics, err := InitMetrics(cli.MetricsAddr)
+		if err != nil {
+			logger.Error("Failed to initialize metrics", "error", err)
+			os.Exit(1)
+		}
+		defer func() {
+			if err := metrics.Close(); err != nil {
+				logger.Error("Failed to close metrics server", "error", err)
+			}
+		}()
+		logger.Info("Metrics enabled", "addr", cli.MetricsAddr)
+	}
 
 	logger.Warn("Starting clamdproxy",
 		"listen", cli.Listen,
@@ -104,10 +129,19 @@ func handleConnection(clientConn net.Conn) {
 		if err := clientConn.Close(); err != nil {
 			logger.Error("Failed to close client connection", "error", err)
 		}
+		// Record connection closed in metrics
+		if proxyMetrics != nil {
+			proxyMetrics.RecordConnectionClosed()
+		}
 	}()
 	clientAddr := clientConn.RemoteAddr()
 
 	logger.Info("Connection established", "client", clientAddr)
+
+	// Record connection in metrics
+	if proxyMetrics != nil {
+		proxyMetrics.RecordConnection(clientAddr.String())
+	}
 
 	backendConn, err := net.Dial("tcp", cli.Backend)
 	if err != nil {
@@ -115,6 +149,10 @@ func handleConnection(clientConn net.Conn) {
 			"backend", &cli.Backend,
 			"client", &clientAddr,
 			"error", err)
+		// Record backend error in metrics
+		if proxyMetrics != nil {
+			proxyMetrics.RecordBackendError()
+		}
 		return
 	}
 	defer func() {

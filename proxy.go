@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // Buffer pools to reduce GC pressure
@@ -62,15 +63,17 @@ var allowedCommands = map[string]bool{
 	"INSTREAM":        true,
 	"VERSION":         true,
 	"VERSIONCOMMANDS": true,
+	"":                true, // Allow empty commands
 }
 
 // ClamdProxy handles bidirectional proxying between client and backend clamd server.
 // It filters commands to prevent unsafe operations from reaching the backend.
 type ClamdProxy struct {
-	client     net.Conn      // Connection to the client
-	backend    net.Conn      // Connection to the backend clamd server
-	backendBuf *bufio.Writer // Buffered writer for backend
-	clientBuf  *bufio.Writer // Buffered writer for client
+	client         net.Conn      // Connection to the client
+	backend        net.Conn      // Connection to the backend clamd server
+	backendBuf     *bufio.Writer // Buffered writer for backend
+	clientBuf      *bufio.Writer // Buffered writer for client
+	lastStreamSize int64         // Size of the last streamed file
 }
 
 // NewClamdProxy creates a new proxy instance with the given client and backend connections
@@ -99,24 +102,46 @@ func (p *ClamdProxy) Start() {
 	bytesWritten := int64(0)
 	var err error
 
+	// Buffer to accumulate response for parsing
+	responseBuf := make([]byte, 0, 1024)
+
 	for {
 		nr, er := p.backend.Read(buf)
 		if nr > 0 {
+			// Add to response buffer for parsing
+			responseBuf = append(responseBuf, buf[:nr]...)
+
+			// Log the raw response for debugging
+			logger.Debug("Received response from backend",
+				"bytes", nr,
+				"preview", truncateString(string(buf[:nr]), 100))
+
+			// Check for virus detection in the response
+			p.parseResponseForVirus(responseBuf)
+
+			// Clear the response buffer if it gets too large or contains a complete response
+			if len(responseBuf) > 4096 || strings.Contains(string(responseBuf), "\n") {
+				responseBuf = make([]byte, 0, 1024)
+			}
+
 			nw, ew := p.clientBuf.Write(buf[0:nr])
 			if nw > 0 {
 				bytesWritten += int64(nw)
 			}
 			if ew != nil {
+				logger.Debug("Error writing to client buffer", "error", ew)
 				err = ew
 				break
 			}
 			if nr != nw {
+				logger.Debug("Short write to client buffer", "expected", nr, "written", nw)
 				err = io.ErrShortWrite
 				break
 			}
 		}
 		if er != nil {
 			if er != io.EOF {
+				logger.Debug("Error reading from backend", "error", er)
 				err = er
 			}
 			break
@@ -137,18 +162,12 @@ func (p *ClamdProxy) Start() {
 
 	if err != nil {
 		if isConnectionClosed(err) {
-			logger.Debug("Backend connection closed",
-				"client", clientAddr,
-				"error", err)
+			logger.Debug("Backend connection closed", "client", clientAddr, "error", err)
 		} else {
-			logger.Debug("Error copying from backend to client",
-				"client", clientAddr,
-				"error", err)
+			logger.Debug("Error copying from backend to client", "client", clientAddr, "error", err)
 		}
 	} else {
-		logger.Info("Proxy completed",
-			"client", clientAddr,
-			"bytesTransferred", bytesWritten)
+		logger.Info("Proxy completed", "client", clientAddr, "bytesTransferred", bytesWritten)
 	}
 }
 
@@ -171,6 +190,10 @@ func (p *ClamdProxy) handleClientToBackend() {
 					logger.Debug("Client connection closed", "client", clientAddr, "error", err)
 				} else {
 					logger.Debug("Error reading command", "client", clientAddr, "error", err)
+					// Record command error in metrics
+					if proxyMetrics != nil {
+						proxyMetrics.RecordCommandError("unknown", err.Error())
+					}
 				}
 			}
 			// Close the backend connection to signal we're done
@@ -180,14 +203,31 @@ func (p *ClamdProxy) handleClientToBackend() {
 			break
 		}
 
+		// Skip empty commands
+		if cmd == "" {
+			continue
+		}
+
 		// Only log commands at appropriate levels
 		logger.Debug("Command received", "client", clientAddr, "command", cmd)
 
-		// Check if command is allowed
-		if isCommandAllowed(cmd) {
+		// Check if command is allowed and record start time
+		allowed := isCommandAllowed(cmd)
+		commandStart := time.Now()
+
+		// Record command metrics
+		if proxyMetrics != nil {
+			proxyMetrics.RecordCommand(cmd, allowed)
+		}
+
+		if allowed {
 			// Forward the command to backend using buffered writer
 			if _, err := p.backendBuf.Write(append([]byte(cmd), delim)); err != nil {
 				logger.Debug("Error forwarding command", "error", err)
+				// Record command error in metrics
+				if proxyMetrics != nil {
+					proxyMetrics.RecordCommandError(cmd, err.Error())
+				}
 				break
 			}
 			// Flush after each command to ensure it's sent immediately
@@ -196,24 +236,44 @@ func (p *ClamdProxy) handleClientToBackend() {
 				break
 			}
 
+			// Record command duration
+			if proxyMetrics != nil && !isInstreamCommand(cmd) {
+				proxyMetrics.RecordCommandDuration(cmd, time.Since(commandStart))
+			}
+
 			// Handle special case for INSTREAM command (file streaming)
 			if isInstreamCommand(cmd) {
 				logger.Debug("Processing INSTREAM data", "client", clientAddr)
 
+				instreamStart := time.Now()
 				if err := p.handleInstream(reader); err != nil {
 					logger.Debug("Error handling INSTREAM data",
 						"client", clientAddr,
 						"error", err)
+					// Record command error in metrics
+					if proxyMetrics != nil {
+						proxyMetrics.RecordCommandError(cmd, err.Error())
+					}
 					break
+				}
+
+				// Record INSTREAM command duration after completion
+				if proxyMetrics != nil {
+					proxyMetrics.RecordCommandDuration(cmd, time.Since(instreamStart))
 				}
 			}
 		} else {
-			logger.Info("Blocked command", "client", clientAddr, "command", cmd)
+			logger.Debug("Blocked command", "client", clientAddr, "command", cmd) // Changed from Info to Debug
 			// Send error response to client using buffered writer
 			response := "ERROR: Command not allowed\n"
 			if _, err := p.clientBuf.WriteString(response); err != nil {
 				logger.Debug("Error sending error response", "error", err)
 				break
+			}
+
+			// Record command duration for blocked commands too
+			if proxyMetrics != nil {
+				proxyMetrics.RecordCommandDuration(cmd, time.Since(commandStart))
 			}
 			if err := p.clientBuf.Flush(); err != nil {
 				logger.Debug("Error flushing error response", "error", err)
@@ -373,27 +433,104 @@ func (p *ClamdProxy) handleInstream(reader *bufio.Reader) error {
 
 		totalBytes += size
 		chunks++
-
-		// Only log chunk details at the most verbose level and only occasionally
-		if chunks%100 == 0 {
-			logger.Debug("INSTREAM progress",
-				"client", clientAddr,
-				"chunks", chunks,
-				"totalBytes", totalBytes)
-		}
-
-		// Flush periodically to balance between batching and responsiveness
-		if chunks%10 == 0 {
-			if err := p.backendBuf.Flush(); err != nil {
-				return fmt.Errorf("failed to flush data: %w", err)
-			}
-		}
 	}
 
-	// Final flush to ensure all data is sent
+	// After the INSTREAM command completes successfully, store the final file size
+	p.lastStreamSize = int64(totalBytes)
+
+	// Flush the backend buffer to ensure all data is sent
 	if err := p.backendBuf.Flush(); err != nil {
-		return fmt.Errorf("failed to flush final data: %w", err)
+		return fmt.Errorf("failed to flush backend buffer: %w", err)
 	}
 
 	return nil
+}
+
+// parseResponseForVirus checks if the response contains virus detection information
+// and records metrics if a virus is found
+func (p *ClamdProxy) parseResponseForVirus(response []byte) {
+	// Convert to string for easier parsing
+	respStr := string(response)
+
+	// Add debug logging to see what's in the response
+	logger.Debug("Parsing response", "length", len(respStr), "preview", truncateString(respStr, 100))
+
+	// Check if this is an INSTREAM response (either clean or with virus)
+	if strings.Contains(respStr, "stream") {
+		// Default to clean file (no virus)
+		virusFound := false
+		virusName := ""
+		filename := "stream"
+
+		// Check for virus detection
+		if strings.Contains(respStr, " FOUND") {
+			logger.Debug("Found virus detection pattern in response")
+			lines := strings.Split(respStr, "\n")
+			for _, line := range lines {
+				if strings.Contains(line, " FOUND") {
+					logger.Debug("Processing virus line", "line", line)
+					parts := strings.Split(line, ": ")
+					if len(parts) >= 2 {
+						fileInfo := parts[0]
+						detectionInfo := strings.TrimSuffix(parts[1], " FOUND")
+
+						// Extract filename from fileInfo
+						// Format: "instream(172.18.0.5@35478)"
+						filename = fileInfo
+						if strings.Contains(fileInfo, "(") && strings.Contains(fileInfo, ")") {
+							// Extract the part between parentheses
+							start := strings.Index(fileInfo, "(") + 1
+							end := strings.Index(fileInfo, ")")
+							if start > 0 && end > start {
+								clientInfo := fileInfo[start:end]
+								// Use client info as part of the filename
+								filename = fileInfo[:start-1] + "_" + clientInfo
+							}
+						}
+
+						virusFound = true
+						virusName = detectionInfo
+
+						logger.Info("Virus detected",
+							"file", filename,
+							"virus", detectionInfo,
+							"size", p.lastStreamSize)
+					}
+				}
+			}
+		} else if strings.Contains(respStr, "OK") {
+			// This is a clean file
+			logger.Debug("Clean file detected", "size", p.lastStreamSize)
+		}
+
+		// Record metrics for all scanned files, whether clean or infected
+		if proxyMetrics != nil {
+			// Use the actual file size if available
+			fileSize := p.lastStreamSize
+			if fileSize == 0 {
+				fileSize = int64(1024) // Default 1KB if size unknown
+			}
+
+			proxyMetrics.RecordFileScan(filename, fileSize, virusFound, virusName)
+
+			if virusFound {
+				logger.Debug("Recorded virus metrics",
+					"file", filename,
+					"size", fileSize,
+					"virus", virusName)
+			} else {
+				logger.Debug("Recorded clean file metrics",
+					"file", filename,
+					"size", fileSize)
+			}
+		}
+	}
+}
+
+// Helper function to truncate long strings for logging
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
