@@ -50,7 +50,7 @@ The easiest way to get started is to download a pre-built binary from the [GitHu
 
 ### Building from Source
 
-If you prefer to build from source:
+If you prefer to build from source (requires Go 1.26 or newer):
 
 ```
 git clone https://github.com/miklosn/clamdproxy.git

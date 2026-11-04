@@ -1,6 +1,7 @@
 name: Release
 
-permissions: write-all
+permissions:
+  contents: write
 
 on:
   push:
@@ -22,9 +23,11 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
+    env:
+      INPUT_VERSION: ${{ inputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -38,26 +41,25 @@ jobs:
       - name: Create tag
         if: github.event_name == 'workflow_dispatch' && inputs.dry_run != true
         run: |
-          VERSION="${{ inputs.version }}"
-          git tag -a "$VERSION" -m "Release $VERSION"
-          git push origin "$VERSION"
+          git tag -a "$INPUT_VERSION" -m "Release $INPUT_VERSION"
+          git push origin "$INPUT_VERSION"
 
       # Determine the tag to use
       - name: Determine tag
         id: tag
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TAG="${{ inputs.version }}"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            TAG="$INPUT_VERSION"
           else
-            TAG="${{ github.ref_name }}"
+            TAG="$GITHUB_REF_NAME"
           fi
-          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
           echo "Using tag: $TAG"
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.22"
+          go-version: "1.27.3"
 
       - name: Run tests
         run: |
@@ -66,11 +68,11 @@ jobs:
 
       # Run GoReleaser
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v4
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         if: github.event_name == 'push' || inputs.dry_run != true
         with:
           distribution: goreleaser
-          version: latest
+          version: v2.19.0
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -78,11 +80,11 @@ jobs:
 
       # Run GoReleaser in dry-run mode
       - name: Run GoReleaser (Dry Run)
-        uses: goreleaser/goreleaser-action@v4
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         if: inputs.dry_run == true
         with:
           distribution: goreleaser
-          version: latest
+          version: v2.19.0
           args: release --snapshot --clean --skip=publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
