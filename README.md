@@ -73,10 +73,14 @@ clamdproxy --listen 127.0.0.1:3310 --backend 127.0.0.1:3311
 - `--log-level`: Logging level: debug, info, warn, error (default: warn)
 - `--pprof`: Address for pprof HTTP server (disabled if empty)
 - `--allow-command`: ClamAV command to allow (can be specified multiple times). If not specified, defaults to a subset of commands (PING, VERSION, VERSIONCOMMANDS, INSTREAM).
+- `--idle-timeout`: Close client connections with no traffic for this long, e.g. `30s` (default: 120s, 0 disables)
+- `--max-connections`: Maximum concurrent client connections; further connections are closed immediately (default: 0, unlimited)
 
 ## Protocol
 
-The proxy supports the clamd protocol as described in the clamd documentation. It handles both null-terminated commands (prefixed with 'z') and newline-terminated commands (prefixed with 'n').
+The proxy supports the clamd protocol as described in the clamd documentation. It handles both null-terminated commands (prefixed with 'z') and newline-terminated commands (prefixed with 'n'), as well as old-style unprefixed newline-terminated commands.
+
+A command is only forwarded when its terminator matches its prefix (NUL for `z`, newline for `n` and for unprefixed commands), so the proxy and clamd always agree on where each command ends. Unprefixed `INSTREAM` is rejected, as clamd requires a prefix for it. Any rejected command gets an `ERROR` reply and the connection is closed, matching clamd's own one-command-per-connection behaviour outside `IDSESSION`.
 
 ## Performance
 

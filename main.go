@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -10,17 +11,20 @@ import (
 	_ "net/http/pprof" // Register pprof handlers
 	"os"
 	"strings"
+	"time"
 
 	"github.com/alecthomas/kong"
 )
 
 // CLI configuration structure for Kong
 var cli struct {
-	Listen          string   `name:"listen" help:"Address to listen on" default:"127.0.0.1:3310"`
-	Backend         string   `name:"backend" help:"Address of the backend clamd server" default:"127.0.0.1:3311"`
-	LogLevel        string   `name:"log-level" help:"Log level (debug, info, warn, error)" default:"warn" enum:"debug,info,warn,error"`
-	PprofAddr       string   `name:"pprof" help:"Address for pprof HTTP server (disabled if empty)" default:""`
-	AllowedCommands []string `name:"allow-command" help:"ClamAV commands to allow (can be specified multiple times)"`
+	Listen          string        `name:"listen" help:"Address to listen on" default:"127.0.0.1:3310"`
+	Backend         string        `name:"backend" help:"Address of the backend clamd server" default:"127.0.0.1:3311"`
+	LogLevel        string        `name:"log-level" help:"Log level (debug, info, warn, error)" default:"warn" enum:"debug,info,warn,error"`
+	PprofAddr       string        `name:"pprof" help:"Address for pprof HTTP server (disabled if empty)" default:""`
+	AllowedCommands []string      `name:"allow-command" help:"ClamAV commands to allow (can be specified multiple times)"`
+	IdleTimeout     time.Duration `name:"idle-timeout" help:"Close client connections with no traffic for this long (0 disables)" default:"120s"`
+	MaxConnections  int           `name:"max-connections" help:"Maximum concurrent client connections (0 = unlimited)" default:"0"`
 }
 
 // Global logger used throughout the code
@@ -87,13 +91,49 @@ func main() {
 		}
 	}()
 
+	serve(listener)
+}
+
+// serve accepts client connections until the listener is closed, enforcing the
+// configured concurrent connection limit by closing connections above it.
+func serve(listener net.Listener) {
+	var slots chan struct{}
+	if cli.MaxConnections > 0 {
+		slots = make(chan struct{}, cli.MaxConnections)
+	}
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			logger.Error("Error accepting connection", "error", err)
 			continue
 		}
-		go handleConnection(conn)
+
+		if slots != nil {
+			select {
+			case slots <- struct{}{}:
+			default:
+				logger.Warn("Connection limit reached, rejecting client",
+					"client", conn.RemoteAddr(),
+					"limit", cli.MaxConnections)
+				if err := conn.Close(); err != nil {
+					logger.Debug("Failed to close rejected connection", "error", err)
+				}
+				continue
+			}
+		}
+
+		go func() {
+			defer func() {
+				if slots != nil {
+					<-slots
+				}
+			}()
+			handleConnection(conn)
+		}()
 	}
 }
 
@@ -125,7 +165,7 @@ func handleConnection(clientConn net.Conn) {
 
 	logger.Info("Connected to backend", "backend", cli.Backend, "client", clientAddr)
 
-	proxy := NewClamdProxy(clientConn, backendConn)
+	proxy := NewClamdProxy(clientConn, backendConn, cli.IdleTimeout)
 	proxy.Start()
 
 	logger.Info("Connection closed", "client", clientAddr)

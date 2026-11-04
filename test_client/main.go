@@ -31,7 +31,7 @@ var (
 		"PING", "VERSION", "VERSIONCOMMANDS",
 		"nPING", "nVERSION", "nVERSIONCOMMANDS",
 		"zPING", "zVERSION", "zVERSIONCOMMANDS",
-		"INSTREAM", "nINSTREAM", "zINSTREAM",
+		"nINSTREAM", "zINSTREAM",
 	}
 
 	// Commands that should be blocked
@@ -40,6 +40,7 @@ var (
 		"SCAN /etc/passwd", "CONTSCAN /etc", "MULTISCAN /var",
 		"STATS", "nSTATS", "zSTATS",
 		"ALLMATCHSCAN /etc", "FILDES", "nFILDES",
+		"INSTREAM", // unprefixed INSTREAM is rejected by the proxy
 	}
 
 	// EICAR test string (safe virus test pattern)
@@ -159,12 +160,12 @@ func testCommand(cmd string) (string, string) {
 
 	// Read response with timeout
 	buffer := make([]byte, 4096) // Larger buffer for potentially larger responses
-	
+
 	// Set a read deadline
 	if err := conn.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second)); err != nil {
 		return "ERROR", fmt.Sprintf("Failed to set deadline: %v", err)
 	}
-	
+
 	n, err := conn.Read(buffer)
 	if err != nil {
 		if err == io.EOF {
@@ -177,12 +178,12 @@ func testCommand(cmd string) (string, string) {
 	}
 
 	response := string(buffer[:n])
-	
+
 	// Check for error responses
 	if strings.HasPrefix(response, "ERROR") {
 		return "BLOCKED", response
 	}
-	
+
 	return "OK", response
 }
 
@@ -233,12 +234,12 @@ func testInstream() (string, string) {
 
 	// Read response with a larger buffer for potentially larger virus detection responses
 	buffer := make([]byte, 4096)
-	
+
 	// Set a read deadline
 	if err := conn.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second)); err != nil {
 		return "ERROR", fmt.Sprintf("Failed to set deadline: %v", err)
 	}
-	
+
 	n, err := conn.Read(buffer)
 	if err != nil {
 		if err == io.EOF {
@@ -251,12 +252,12 @@ func testInstream() (string, string) {
 	}
 
 	response := string(buffer[:n])
-	
+
 	// Check if the response contains a virus detection
 	if strings.Contains(response, "FOUND") {
 		return "VIRUS", response
 	}
-	
+
 	return "OK", response
 }
 
@@ -292,6 +293,7 @@ func formatResponse(response string) string {
 
 	return response
 }
+
 // isBackendReachable checks if the proxy server is reachable
 func isBackendReachable() bool {
 	conn, err := net.DialTimeout("tcp", proxyAddr, time.Duration(timeout)*time.Second)

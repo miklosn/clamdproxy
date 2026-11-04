@@ -4,6 +4,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -90,12 +91,12 @@ func TestIsCommandAllowed(t *testing.T) {
 	for k, v := range allowedCommands {
 		originalAllowed[k] = v
 	}
-	
+
 	// Restore after test
 	defer func() {
 		allowedCommands = originalAllowed
 	}()
-	
+
 	// Set test allowed commands
 	allowedCommands = map[string]bool{
 		"PING":            true,
@@ -103,7 +104,7 @@ func TestIsCommandAllowed(t *testing.T) {
 		"VERSIONCOMMANDS": true,
 		"INSTREAM":        true,
 	}
-	
+
 	allowedCmds := []string{
 		"PING", "VERSION", "VERSIONCOMMANDS", "INSTREAM",
 		"zPING", "zVERSION", "zVERSIONCOMMANDS", "zINSTREAM",
@@ -171,8 +172,9 @@ func TestIsInstreamCommand(t *testing.T) {
 		cmd      string
 		expected bool
 	}{
-		{"INSTREAM", false},
+		{"INSTREAM", true},
 		{"zINSTREAM", true},
+		{"zINSTREAM extra", true},
 		{"nINSTREAM", true},
 		{"PING", false},
 		{"zPING", false},
@@ -283,7 +285,8 @@ func TestHandleInstream_ZeroChunk(t *testing.T) {
 // and returns everything received.
 func readWithDeadline(t *testing.T, conn net.Conn, d time.Duration) []byte {
 	t.Helper()
-	if err := conn.SetReadDeadline(time.Now().Add(d)); err != nil {
+	// net.Pipe refuses deadlines once the peer has closed; Read then returns EOF at once.
+	if err := conn.SetReadDeadline(time.Now().Add(d)); err != nil && !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("SetReadDeadline: %v", err)
 	}
 	var out []byte
@@ -325,5 +328,228 @@ func TestFramingMismatchDoesNotForwardStreamData(t *testing.T) {
 	received := readWithDeadline(t, backendSide, time.Second)
 	if bytes.Contains(received, []byte("SHUTDOWN")) {
 		t.Fatalf("stream data reached the backend: %q", received)
+	}
+}
+
+func TestParseCommand(t *testing.T) {
+	tests := []struct {
+		cmd    string
+		prefix byte
+		name   string
+	}{
+		{"PING", 0, "PING"},
+		{"zPING", 'z', "PING"},
+		{"nINSTREAM", 'n', "INSTREAM"},
+		{"SCAN /etc/passwd", 0, "SCAN"},
+		{"zSCAN /etc/passwd", 'z', "SCAN"},
+		{"", 0, ""},
+		{" zPING", 0, ""},
+		{"z PING", 'z', ""},
+		{"PING\t", 0, "PING\t"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.cmd, func(t *testing.T) {
+			prefix, name := parseCommand(tc.cmd)
+			if prefix != tc.prefix || name != tc.name {
+				t.Errorf("parseCommand(%q) = (%q, %q), want (%q, %q)", tc.cmd, prefix, name, tc.prefix, tc.name)
+			}
+		})
+	}
+}
+
+func TestIsFramingValid(t *testing.T) {
+	tests := []struct {
+		cmd      string
+		delim    byte
+		expected bool
+	}{
+		{"zPING", nullDelimiter, true},
+		{"zPING", newlineDelimiter, false},
+		{"nPING", newlineDelimiter, true},
+		{"nPING", nullDelimiter, false},
+		{"PING", newlineDelimiter, true},
+		{"PING", nullDelimiter, false},
+		{"zINSTREAM", nullDelimiter, true},
+		{"nINSTREAM", newlineDelimiter, true},
+		{"INSTREAM", newlineDelimiter, false},
+		{"zINSTREAM", newlineDelimiter, false},
+		{"nINSTREAM", nullDelimiter, false},
+		{"", newlineDelimiter, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.cmd+string(tc.delim), func(t *testing.T) {
+			if got := isFramingValid(tc.cmd, tc.delim); got != tc.expected {
+				t.Errorf("isFramingValid(%q, %q) = %v, want %v", tc.cmd, tc.delim, got, tc.expected)
+			}
+		})
+	}
+}
+
+// startPipeProxy wires a proxy between two in-memory connections and returns the
+// client-facing and backend-facing ends. The client end is closed when the proxy
+// finishes, as handleConnection does.
+func startPipeProxy(t *testing.T, idleTimeout time.Duration) (client, backend net.Conn, done <-chan struct{}) {
+	t.Helper()
+	clientSide, proxyClient := net.Pipe()
+	proxyBackend, backendSide := net.Pipe()
+
+	finished := make(chan struct{})
+	go func() {
+		NewClamdProxy(proxyClient, proxyBackend, idleTimeout).Start()
+		_ = proxyClient.Close()
+		close(finished)
+	}()
+	t.Cleanup(func() {
+		_ = clientSide.Close()
+		_ = backendSide.Close()
+	})
+	return clientSide, backendSide, finished
+}
+
+func TestBlockedCommandClosesConnection(t *testing.T) {
+	client, backend, _ := startPipeProxy(t, 0)
+
+	go func() { _, _ = client.Write([]byte("SHUTDOWN\n")) }()
+
+	reader := bufio.NewReader(client)
+	resp, err := reader.ReadString('\n')
+	if err != nil || resp != "ERROR: Command not allowed\n" {
+		t.Fatalf("unexpected response %q, err %v", resp, err)
+	}
+	if _, err := reader.ReadByte(); err != io.EOF {
+		t.Errorf("expected connection closed after blocked command, got %v", err)
+	}
+	// The proxy closes its backend end on rejection, so the peer sees EOF with no data.
+	buf := make([]byte, 16)
+	if n, err := backend.Read(buf); err != io.EOF || n != 0 {
+		t.Errorf("backend got %q, err %v; want EOF with no data", buf[:n], err)
+	}
+}
+
+func TestAllowedCommandIsForwarded(t *testing.T) {
+	client, backend, _ := startPipeProxy(t, 0)
+
+	go func() { _, _ = client.Write([]byte("zPING\x00")) }()
+
+	buf := make([]byte, 16)
+	n, err := backend.Read(buf)
+	if err != nil || string(buf[:n]) != "zPING\x00" {
+		t.Fatalf("backend got %q, err %v", buf[:n], err)
+	}
+
+	go func() { _, _ = backend.Write([]byte("PONG\n")) }()
+	resp, err := bufio.NewReader(client).ReadString('\n')
+	if err != nil || resp != "PONG\n" {
+		t.Fatalf("client got %q, err %v", resp, err)
+	}
+}
+
+func TestIdleTimeoutClosesConnection(t *testing.T) {
+	_, _, done := startPipeProxy(t, 50*time.Millisecond)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy did not close an idle client connection")
+	}
+}
+
+// holdingBackend answers "PONG\n" to the first line of each connection and then
+// keeps the connection open until the peer closes it, so the proxy session stays
+// alive for as long as the client does.
+func holdingBackend(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				r := bufio.NewReader(conn)
+				if _, err := r.ReadString('\n'); err != nil {
+					return
+				}
+				if _, err := conn.Write([]byte("PONG\n")); err != nil {
+					return
+				}
+				_, _ = io.Copy(io.Discard, r)
+			}()
+		}
+	}()
+	t.Cleanup(func() { _ = ln.Close() })
+	return ln
+}
+
+func pingThroughProxy(t *testing.T, addr string) (net.Conn, string, error) {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	if _, err := conn.Write([]byte("PING\n")); err != nil {
+		return conn, "", err
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	buf := make([]byte, 16)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return conn, string(buf[:n]), err
+	}
+	if resp := string(buf[:n]); resp != "PONG\n" {
+		return conn, resp, io.ErrUnexpectedEOF
+	}
+	return conn, "PONG\n", nil
+}
+
+func TestServeMaxConnections(t *testing.T) {
+	backendLn := holdingBackend(t)
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	savedBackend, savedMax := cli.Backend, cli.MaxConnections
+	cli.Backend, cli.MaxConnections = backendLn.Addr().String(), 1
+	t.Cleanup(func() {
+		_ = proxyLn.Close()
+		cli.Backend, cli.MaxConnections = savedBackend, savedMax
+	})
+	go serve(proxyLn)
+	addr := proxyLn.Addr().String()
+
+	first, resp, err := pingThroughProxy(t, addr)
+	if err != nil {
+		t.Fatalf("first connection should be served, got %q: %v", resp, err)
+	}
+
+	second, resp, err := pingThroughProxy(t, addr)
+	_ = second.Close()
+	if err == nil {
+		t.Fatalf("second connection should be rejected, got %q", resp)
+	}
+
+	// Releasing the slot happens after the proxy observes the close, so retry briefly.
+	_ = first.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		conn, resp, err := pingThroughProxy(t, addr)
+		_ = conn.Close()
+		if err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("slot was not released after first client closed, last response %q", resp)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
