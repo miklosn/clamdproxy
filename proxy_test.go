@@ -278,3 +278,52 @@ func TestHandleInstream_ZeroChunk(t *testing.T) {
 		t.Errorf("Expected %v, got %v", expected, backendBuf.Bytes())
 	}
 }
+
+// readWithDeadline reads from conn until an error occurs or the deadline passes
+// and returns everything received.
+func readWithDeadline(t *testing.T, conn net.Conn, d time.Duration) []byte {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(d)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	var out []byte
+	buf := make([]byte, 4096)
+	for {
+		n, err := conn.Read(buf)
+		out = append(out, buf[:n]...)
+		if err != nil {
+			return out
+		}
+	}
+}
+
+// A z-prefixed command terminated by a newline is framed differently by clamd,
+// which reads until NUL, than by the proxy. The proxy must not enter raw INSTREAM
+// forwarding in that case, otherwise the "stream data" reaches clamd as commands.
+func TestFramingMismatchDoesNotForwardStreamData(t *testing.T) {
+	clientSide, proxyClient := net.Pipe()
+	proxyBackend, backendSide := net.Pipe()
+
+	p := &ClamdProxy{
+		client:     proxyClient,
+		backend:    proxyBackend,
+		backendBuf: bufio.NewWriter(proxyBackend),
+		clientBuf:  bufio.NewWriter(proxyClient),
+	}
+	go func() {
+		p.Start()
+		_ = proxyClient.Close()
+	}()
+	go func() { _, _ = io.Copy(io.Discard, clientSide) }()
+
+	payload := "zINSTREAM\n" + "\x00\x00\x00\x0a" + "nSHUTDOWN\n" + "\x00\x00\x00\x00"
+	if _, err := clientSide.Write([]byte(payload)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = clientSide.Close()
+
+	received := readWithDeadline(t, backendSide, time.Second)
+	if bytes.Contains(received, []byte("SHUTDOWN")) {
+		t.Fatalf("stream data reached the backend: %q", received)
+	}
+}
