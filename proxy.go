@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // Buffer pools to reduce GC pressure
@@ -73,8 +74,34 @@ type ClamdProxy struct {
 	clientBuf  *bufio.Writer // Buffered writer for client
 }
 
-// NewClamdProxy creates a new proxy instance with the given client and backend connections
-func NewClamdProxy(client, backend net.Conn) *ClamdProxy {
+// idleConn refreshes the connection deadline before every read and write so that
+// idle peers are disconnected while slow but active transfers are not.
+type idleConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *idleConn) Read(b []byte) (int, error) {
+	if err := c.SetDeadline(time.Now().Add(c.timeout)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *idleConn) Write(b []byte) (int, error) {
+	if err := c.SetDeadline(time.Now().Add(c.timeout)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Write(b)
+}
+
+// NewClamdProxy creates a new proxy instance with the given client and backend connections.
+// A non-zero idleTimeout closes the client connection when no data is read from or
+// written to it for that long.
+func NewClamdProxy(client, backend net.Conn, idleTimeout time.Duration) *ClamdProxy {
+	if idleTimeout > 0 {
+		client = &idleConn{Conn: client, timeout: idleTimeout}
+	}
 	return &ClamdProxy{
 		client:     client,
 		backend:    backend,
@@ -122,11 +149,11 @@ func (p *ClamdProxy) Start() {
 			break
 		}
 
-		// Flush the buffer periodically to avoid delays
-		if p.clientBuf.Buffered() > 32*1024 {
-			if err := p.clientBuf.Flush(); err != nil {
-				logger.Debug("Error flushing buffer to client", "error", err)
-			}
+		// Backend responses are small and complete per read, so flush each one
+		// to the client immediately instead of waiting for the connection to end.
+		if err := p.clientBuf.Flush(); err != nil {
+			logger.Debug("Error flushing buffer to client", "error", err)
+			break
 		}
 	}
 
@@ -158,6 +185,14 @@ func (p *ClamdProxy) handleClientToBackend() {
 	reader := bufio.NewReader(p.client)
 	clientAddr := p.client.RemoteAddr()
 
+	// Closing the backend on every exit path unblocks the backend->client copy in
+	// Start, so the session ends as soon as the client side is done.
+	defer func() {
+		if err := p.backend.Close(); err != nil {
+			logger.Debug("Error closing backend connection", "error", err)
+		}
+	}()
+
 	for {
 		// Try to read a command
 		cmd, delim, err := readCommand(reader)
@@ -173,61 +208,96 @@ func (p *ClamdProxy) handleClientToBackend() {
 					logger.Debug("Error reading command", "client", clientAddr, "error", err)
 				}
 			}
-			// Close the backend connection to signal we're done
-			if err := p.backend.Close(); err != nil {
-				logger.Debug("Error closing backend connection", "error", err)
-			}
 			break
 		}
 
 		// Only log commands at appropriate levels
 		logger.Debug("Command received", "client", clientAddr, "command", cmd)
 
-		// Check if command is allowed
-		if isCommandAllowed(cmd) {
-			// Forward the command to backend using buffered writer
-			if _, err := p.backendBuf.Write(append([]byte(cmd), delim)); err != nil {
-				logger.Debug("Error forwarding command", "error", err)
-				break
-			}
-			// Flush after each command to ensure it's sent immediately
-			if err := p.backendBuf.Flush(); err != nil {
-				logger.Debug("Error flushing command", "error", err)
-				break
-			}
+		// A command whose delimiter does not match its prefix would be framed
+		// differently by clamd than by this proxy, so it is rejected before the
+		// allowlist check. Any rejection ends the session, as clamd itself does
+		// after a single command outside IDSESSION.
+		if !isFramingValid(cmd, delim) {
+			logger.Info("Blocked command", "client", clientAddr, "command", cmd, "reason", "invalid framing")
+			p.sendError()
+			break
+		}
+		if !isCommandAllowed(cmd) {
+			logger.Info("Blocked command", "client", clientAddr, "command", cmd, "reason", "not allowed")
+			p.sendError()
+			break
+		}
 
-			// Handle special case for INSTREAM command (file streaming)
-			if isInstreamCommand(cmd) {
-				logger.Debug("Processing INSTREAM data", "client", clientAddr)
+		// Forward the command to backend using buffered writer
+		if _, err := p.backendBuf.Write(append([]byte(cmd), delim)); err != nil {
+			logger.Debug("Error forwarding command", "error", err)
+			break
+		}
+		// Flush after each command to ensure it's sent immediately
+		if err := p.backendBuf.Flush(); err != nil {
+			logger.Debug("Error flushing command", "error", err)
+			break
+		}
 
-				if err := p.handleInstream(reader); err != nil {
-					logger.Debug("Error handling INSTREAM data",
-						"client", clientAddr,
-						"error", err)
-					break
-				}
-			}
-		} else {
-			logger.Info("Blocked command", "client", clientAddr, "command", cmd)
-			// Send error response to client using buffered writer
-			response := "ERROR: Command not allowed\n"
-			if _, err := p.clientBuf.WriteString(response); err != nil {
-				logger.Debug("Error sending error response", "error", err)
-				break
-			}
-			if err := p.clientBuf.Flush(); err != nil {
-				logger.Debug("Error flushing error response", "error", err)
+		// Handle special case for INSTREAM command (file streaming)
+		if isInstreamCommand(cmd) {
+			logger.Debug("Processing INSTREAM data", "client", clientAddr)
+
+			if err := p.handleInstream(reader); err != nil {
+				logger.Debug("Error handling INSTREAM data",
+					"client", clientAddr,
+					"error", err)
 				break
 			}
 		}
 	}
 }
 
+// sendError sends the rejection response to the client.
+func (p *ClamdProxy) sendError() {
+	if _, err := p.clientBuf.WriteString("ERROR: Command not allowed\n"); err != nil {
+		logger.Debug("Error sending error response", "error", err)
+		return
+	}
+	if err := p.clientBuf.Flush(); err != nil {
+		logger.Debug("Error flushing error response", "error", err)
+	}
+}
+
+// parseCommand splits a raw command into its optional z/n prefix and the command
+// name. The prefix must be the very first byte, as clamd requires, and the name
+// ends at the first space so that arguments are ignored.
+func parseCommand(cmd string) (prefix byte, name string) {
+	if len(cmd) > 0 && (cmd[0] == 'z' || cmd[0] == 'n') {
+		prefix = cmd[0]
+		cmd = cmd[1:]
+	}
+	name, _, _ = strings.Cut(cmd, " ")
+	return prefix, name
+}
+
+// isFramingValid reports whether the delimiter that terminated a command matches
+// what clamd expects for its prefix: NUL for 'z', newline for 'n', and newline for
+// old-style unprefixed commands. Unprefixed INSTREAM is rejected because clamd
+// requires a prefix for it and the proxy could not frame the data stream reliably.
+func isFramingValid(cmd string, delim byte) bool {
+	prefix, name := parseCommand(cmd)
+	switch prefix {
+	case 'z':
+		return delim == nullDelimiter
+	case 'n':
+		return delim == newlineDelimiter
+	default:
+		return delim == newlineDelimiter && name != "INSTREAM"
+	}
+}
+
 // isInstreamCommand determines if a command is an INSTREAM command
 // which requires special handling for the data stream that follows.
 func isInstreamCommand(cmd string) bool {
-	return (strings.HasPrefix(cmd, "z") && strings.HasSuffix(cmd, "INSTREAM")) ||
-		(strings.HasPrefix(cmd, "n") && strings.HasSuffix(cmd, "INSTREAM"))
+	_, name := parseCommand(cmd)
+	return name == "INSTREAM"
 }
 
 // readCommand reads a command from the reader, handling both null and newline delimiters.
@@ -267,20 +337,8 @@ func readCommand(reader *bufio.Reader) (string, byte, error) {
 // It extracts the actual command name, handling protocol prefixes, and checks
 // against the allowedCommands whitelist.
 func isCommandAllowed(cmd string) bool {
-	// Extract the actual command from the prefix
-	cmdParts := strings.Fields(cmd)
-	if len(cmdParts) == 0 {
-		return false // Empty commands are not allowed
-	}
-
-	// Handle commands with z/n prefix (protocol variations)
-	actualCmd := cmdParts[0]
-	if strings.HasPrefix(actualCmd, "z") || strings.HasPrefix(actualCmd, "n") {
-		actualCmd = actualCmd[1:]
-	}
-
-	// Check if command is in allowed list
-	return allowedCommands[actualCmd]
+	_, name := parseCommand(cmd)
+	return allowedCommands[name]
 }
 
 // isConnectionClosed checks if an error indicates that the connection was closed by the client
